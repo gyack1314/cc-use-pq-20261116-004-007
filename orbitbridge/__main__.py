@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import audit, catalog, diagnostics, export, handoff, ingest, intake, protocol, quality, reconcile, recovery, store
+from . import audit, capacity, catalog, diagnostics, export, handoff, ingest, intake, protocol, quality, reconcile, recovery, store
 
 
 def parser() -> argparse.ArgumentParser:
@@ -28,6 +28,30 @@ def parser() -> argparse.ArgumentParser:
     substate = commands.add_parser("subscription-state", help="变更订阅状态")
     substate.add_argument("subscription_id")
     substate.add_argument("state", choices=("active", "inactive"))
+    region_cap = commands.add_parser("region-capacity", help="设置或查看区域待办容量（无上限参数则查看）")
+    region_cap.add_argument("region")
+    region_cap.add_argument("max_pending", nargs="?", type=int)
+    region_cap.add_argument("--operator")
+    region_cap_remove = commands.add_parser("region-capacity-remove", help="移除区域容量策略，恢复不限")
+    region_cap_remove.add_argument("region")
+    region_cap_remove.add_argument("--operator", required=True)
+    sub_cap = commands.add_parser("subscription-capacity", help="设置或查看订阅组待办容量（无上限参数则查看）")
+    sub_cap.add_argument("subscription_id")
+    sub_cap.add_argument("max_pending", nargs="?", type=int)
+    sub_cap.add_argument("--operator")
+    sub_cap_remove = commands.add_parser("subscription-capacity-remove", help="移除订阅组容量策略，恢复不限")
+    sub_cap_remove.add_argument("subscription_id")
+    sub_cap_remove.add_argument("--operator", required=True)
+    commands.add_parser("capacity-policies", help="列出全部容量策略")
+    deferred = commands.add_parser("deferred", help="查看暂缓交接队列（区别于隔离拒收）")
+    deferred.add_argument("--status", choices=("waiting", "dispatched"))
+    deferred.add_argument("--region")
+    deferred.add_argument("--subscription")
+    deferred.add_argument("--limit", type=int, default=100)
+    deferred.add_argument("--after", type=int, default=0)
+    drain = commands.add_parser("capacity-drain", help="显式恢复暂缓路由的派单")
+    drain.add_argument("--region")
+    drain.add_argument("--subscription")
     packet = commands.add_parser("ingest", help="导入单个观测包")
     packet.add_argument("packet")
     directory = commands.add_parser("ingest-dir", help="按文件名导入目录中的 JSONL")
@@ -123,12 +147,41 @@ def _demo(workspace: Path) -> dict[str, Any]:
             raise RuntimeError("合成演示结果与交接预期不符")
         ack = handoff.acknowledge(connection, queue[0]["handoff_id"], "值守员甲",
                                   when="2026-10-28T12:04:00Z")
+        # 容量策略演示：区域待办上限为 1，新匹配观测先暂缓；确认释放容量后自动恢复派单。
+        capacity.set_region_capacity(connection, "forest-north", 1, "值班长",
+                                     when="2026-10-28T12:05:00Z")
+        surge = [
+            {"kind": "observation", "id": "sim-003", "observed_at": "2026-10-28T12:06:00Z",
+             "region": "forest-north", "latitude": 31.22, "longitude": 121.47, "confidence": "0.91",
+             "severity": 5, "source": "infrared"},
+            {"kind": "observation", "id": "sim-004", "observed_at": "2026-10-28T12:07:00Z",
+             "region": "forest-north", "latitude": 31.23, "longitude": 121.48, "confidence": "0.80",
+             "severity": 3, "source": "optical"},
+        ]
+        surge_source = workspace / "surge-packet.jsonl"
+        surge_source.write_bytes(protocol.encode_packet("sat-a", 2, "2026-10-28T12:08:00Z", surge))
+        surge_result = ingest.ingest_file(connection, surge_source, when="2026-10-28T12:09:00Z")
+        if surge_result.status != "accepted" or (surge_result.handoff_count, surge_result.deferred_count) != (1, 1):
+            raise RuntimeError("容量满时高风险观测应获得名额，其余观测暂缓交接")
+        if store.counts(connection)["quarantine"] != 0:
+            raise RuntimeError("容量暂缓不得产生隔离拒收")
+        # 高风险（severity 5）必须抢占唯一名额，低风险进入暂缓队列
+        pending_item = handoff.list_handoffs(connection, status="pending")[0]
+        if pending_item["external_id"] != "sim-003":
+            raise RuntimeError("容量名额未按风险优先分配给高风险观测")
+        handoff.acknowledge(connection, pending_item["handoff_id"], "值守员乙",
+                            when="2026-10-28T12:10:00Z")
+        waiting_after = capacity.list_deferred(connection, status="waiting")
+        if waiting_after:
+            raise RuntimeError("确认释放容量后暂缓路由应自动恢复")
         trace = audit.handoff_trace(connection, queue[0]["handoff_id"])
         issues = audit.verify_lineage(connection)
         if issues or trace["handoff"]["batch_id"] != accepted.batch_id:
             raise RuntimeError(f"合成演示来源链不一致：{issues}")
         return {"accepted": accepted.as_dict(), "duplicate": duplicate.as_dict(),
-                "handoff": ack, "counts": store.counts(connection), "integrity_issues": issues}
+                "handoff": ack, "surge": surge_result.as_dict(),
+                "capacity": capacity.region_capacity_status(connection, "forest-north"),
+                "counts": store.counts(connection), "integrity_issues": issues}
     finally:
         connection.close()
 
@@ -147,6 +200,27 @@ def dispatch(args: argparse.Namespace) -> Any:
                                                  args.severity, args.confidence)
         if args.command == "subscription-state":
             return catalog.set_subscription_active(connection, args.subscription_id, args.state == "active")
+        if args.command == "region-capacity":
+            if args.max_pending is None:
+                return capacity.region_capacity_status(connection, args.region)
+            return capacity.set_region_capacity(connection, args.region, args.max_pending, args.operator)
+        if args.command == "region-capacity-remove":
+            return capacity.remove_region_capacity(connection, args.region, args.operator)
+        if args.command == "subscription-capacity":
+            if args.max_pending is None:
+                return capacity.subscription_capacity_status(connection, args.subscription_id)
+            return capacity.set_subscription_capacity(connection, args.subscription_id, args.max_pending,
+                                                      args.operator)
+        if args.command == "subscription-capacity-remove":
+            return capacity.remove_subscription_capacity(connection, args.subscription_id, args.operator)
+        if args.command == "capacity-policies":
+            return capacity.list_capacity_policies(connection)
+        if args.command == "deferred":
+            return capacity.list_deferred(connection, status=args.status, region=args.region,
+                                          subscription_id=args.subscription, limit=args.limit,
+                                          after_id=args.after)
+        if args.command == "capacity-drain":
+            return capacity.drain_deferred(connection, region=args.region, subscription_id=args.subscription)
         if args.command == "ingest":
             return ingest.ingest_file(connection, args.packet).as_dict()
         if args.command == "ingest-dir":
@@ -215,7 +289,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in {"verify", "quality", "reconcile"} and not result["ok"]:
             return 2
         return 0
-    except (catalog.CatalogError, handoff.HandoffError, ingest.IngestError, audit.AuditError, recovery.RecoveryError,
+    except (capacity.CapacityError, catalog.CatalogError, handoff.HandoffError, ingest.IngestError,
+            audit.AuditError, recovery.RecoveryError,
             intake.ManifestError, export.ExportError, reconcile.ReconcileError) as exc:
         print(json.dumps({"error": getattr(exc, "code", "error"), "message": str(exc),
                           "quarantine_id": getattr(exc, "quarantine_id", None)}, ensure_ascii=False), file=sys.stderr)

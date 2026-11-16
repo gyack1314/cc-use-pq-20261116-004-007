@@ -47,6 +47,30 @@ CREATE TABLE IF NOT EXISTS handoffs (
         (status='acknowledged' AND acknowledged_at IS NOT NULL AND operator IS NOT NULL))
 );
 CREATE INDEX IF NOT EXISTS handoffs_status ON handoffs(status, subscription_id);
+CREATE TABLE IF NOT EXISTS region_capacities (
+  region TEXT PRIMARY KEY, max_pending INTEGER NOT NULL CHECK(max_pending >= 0),
+  operator TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS subscription_capacities (
+  subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(subscription_id),
+  max_pending INTEGER NOT NULL CHECK(max_pending >= 0),
+  operator TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deferred_routings (
+  deferred_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  observation_id INTEGER NOT NULL REFERENCES observations(observation_id),
+  subscription_id TEXT NOT NULL REFERENCES subscriptions(subscription_id),
+  region TEXT NOT NULL,
+  reason_code TEXT NOT NULL CHECK(reason_code IN ('region_full','subscription_full','both_full')),
+  status TEXT NOT NULL CHECK(status IN ('waiting','dispatched')),
+  created_at TEXT NOT NULL, released_at TEXT,
+  handoff_id INTEGER REFERENCES handoffs(handoff_id),
+  UNIQUE(observation_id, subscription_id),
+  CHECK((status='waiting' AND released_at IS NULL AND handoff_id IS NULL) OR
+        (status='dispatched' AND released_at IS NOT NULL AND handoff_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS deferred_status ON deferred_routings(status, deferred_id);
+CREATE INDEX IF NOT EXISTS deferred_region ON deferred_routings(region, status);
 CREATE TABLE IF NOT EXISTS quarantine (
   quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT, station_id TEXT, sequence INTEGER, source_name TEXT NOT NULL,
   content_digest TEXT NOT NULL, reason_code TEXT NOT NULL, detail TEXT NOT NULL,
@@ -171,7 +195,8 @@ def get_handoff(connection: sqlite3.Connection, handoff_id: int) -> dict[str, An
 
 
 def counts(connection: sqlite3.Connection) -> dict[str, int]:
-    names = ("stations", "subscriptions", "batches", "observations", "handoffs", "quarantine", "activity")
+    names = ("stations", "subscriptions", "batches", "observations", "handoffs", "deferred_routings",
+             "region_capacities", "subscription_capacities", "quarantine", "activity")
     return {name: int(connection.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in names}
 
 
@@ -193,4 +218,10 @@ def integrity_check(connection: sqlite3.Connection) -> list[str]:
     ):
         if row["record_count"] != row["actual"]:
             issues.append(f"batch_count:{row['batch_id']}")
+    for row in connection.execute(
+        "SELECT d.deferred_id,d.handoff_id,h.subscription_id,h.observation_id FROM deferred_routings d "
+        "JOIN handoffs h ON h.handoff_id=d.handoff_id WHERE d.status='dispatched' "
+        "AND (h.subscription_id<>d.subscription_id OR h.observation_id<>d.observation_id)"
+    ):
+        issues.append(f"deferred_handoff_mismatch:{row['deferred_id']}")
     return issues

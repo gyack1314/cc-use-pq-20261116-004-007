@@ -5,7 +5,7 @@ import json
 import sqlite3
 from typing import Any
 
-from . import catalog, handoff, store
+from . import capacity as capacity_module, catalog, handoff, store
 
 
 class AuditError(ValueError):
@@ -115,8 +115,12 @@ def region_report(connection: sqlite3.Connection, region: str) -> dict[str, Any]
     status_rows = store.many(connection, "SELECT h.status,COUNT(*) AS count FROM handoffs h "
                              "JOIN observations o USING(observation_id) WHERE o.region=? GROUP BY h.status", (region,))
     status = {row["status"]: row["count"] for row in status_rows}
+    waiting = store.one(connection, "SELECT COUNT(*) AS count FROM deferred_routings "
+                                    "WHERE region=? AND status='waiting'", (region,))["count"]
+    capacity = capacity_module.region_capacity_status(connection, region)
     return {"region": region, "observations": observations["count"], "latest": observations["latest"],
             "pending": status.get("pending", 0), "acknowledged": status.get("acknowledged", 0),
+            "waiting": int(waiting), "capacity": capacity,
             "subscriptions": catalog.list_subscriptions(connection, region)}
 
 

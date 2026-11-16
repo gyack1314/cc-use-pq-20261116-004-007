@@ -1,30 +1,16 @@
-"""从已提交观测生成交接项，并负责确认状态。"""
+"""交接项确认状态与队列查询；容量规划与暂缓路由见 capacity 模块。"""
 from __future__ import annotations
 
 import sqlite3
 from typing import Any
 
-from . import catalog, store
-from .normalize import Observation
+from . import capacity, catalog, store
 
 
 class HandoffError(ValueError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
-
-
-def route_observation(connection: sqlite3.Connection, observation_id: int, observation: Observation, when: str) -> int:
-    matches = catalog.matching_subscriptions(connection, observation.region, observation.severity, observation.confidence)
-    for subscription in matches:
-        cursor = connection.execute(
-            "INSERT INTO handoffs(observation_id,subscription_id,status,created_at) VALUES(?,?,'pending',?)",
-            (observation_id, subscription["subscription_id"], when),
-        )
-        handoff_id = int(cursor.lastrowid)
-        store.record_activity(connection, "handoff_created", "handoff", str(handoff_id), when,
-                              {"observation_id": observation_id, "subscription_id": subscription["subscription_id"]})
-    return len(matches)
 
 
 def acknowledge(connection: sqlite3.Connection, handoff_id: int, operator: str, *, when: str | None = None) -> dict[str, Any]:
@@ -49,7 +35,11 @@ def acknowledge(connection: sqlite3.Connection, handoff_id: int, operator: str, 
             raise HandoffError("acknowledge_conflict", "确认状态冲突")
         store.record_activity(connection, "handoff_acknowledged", "handoff", str(handoff_id), timestamp,
                               {"operator": operator.strip()})
-    return {"status": "acknowledged", **store.get_handoff(connection, handoff_id)}
+        # 确认即释放待办容量：同一事务内按风险优先、同风险按到达次序恢复暂缓路由，
+        # 保证人员释放容量后等待中的高风险观测立即获得确定性派单。
+        released = capacity._drain_locked(connection, timestamp)
+    detail = store.get_handoff(connection, handoff_id)
+    return {"status": "acknowledged", **detail, "capacity_released": released}
 
 
 def list_handoffs(connection: sqlite3.Connection, *, subscription_id: str | None = None,
@@ -92,5 +82,7 @@ def subscription_summary(connection: sqlite3.Connection, subscription_id: str) -
     rows = store.many(connection, "SELECT status,COUNT(*) AS amount FROM handoffs WHERE subscription_id=? GROUP BY status",
                       (subscription_id,))
     counts = {row["status"]: row["amount"] for row in rows}
+    waiting = store.one(connection, "SELECT COUNT(*) AS amount FROM deferred_routings "
+                                    "WHERE subscription_id=? AND status='waiting'", (subscription_id,))["amount"]
     return {"subscription": subscription, "pending": counts.get("pending", 0),
-            "acknowledged": counts.get("acknowledged", 0)}
+            "acknowledged": counts.get("acknowledged", 0), "waiting": int(waiting)}

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import catalog, handoff, protocol, store
+from . import capacity, catalog, protocol, store
 from .normalize import ObservationError, normalize_batch, parse_time
 
 
@@ -31,6 +31,7 @@ class IngestResult:
     observation_count: int
     handoff_count: int
     packet_id: str
+    deferred_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -105,15 +106,20 @@ def ingest_packet(connection: sqlite3.Connection, packet: protocol.Packet, *, wh
                     raise IngestError("observation_conflict", "观测标识已由站点提交")
             batch_id = store.insert_batch(connection, station_id, sequence, packet_id, packet.canonical_digest,
                                           packet.envelope.created_at, timestamp, packet.source_name, len(normalized))
-            handoff_count = 0
             for observation in normalized:
-                observation_id = store.insert_observation(connection, batch_id, station_id, observation.as_dict())
-                handoff_count += handoff.route_observation(connection, observation_id, observation, timestamp)
+                store.insert_observation(connection, batch_id, station_id, observation.as_dict())
+            # 容量规划与暂缓在同一事务内完成：证据先落库，路由按风险优先抢占名额，
+            # 落选路由进入 deferred_routings，绝不回滚批次或推进失败游标。
+            routing = capacity.route_batch(connection, batch_id, timestamp)
+            handoff_count = routing["handoff_count"]
+            deferred_count = routing["deferred_count"]
             store.update_cursor(connection, station_id, sequence, batch_id, timestamp)
             store.record_activity(connection, "batch_committed", "batch", str(batch_id), timestamp,
                                   {"station_id": station_id, "sequence": sequence,
-                                   "observations": len(normalized), "handoffs": handoff_count})
-            return IngestResult("accepted", station_id, sequence, batch_id, len(normalized), handoff_count, packet_id)
+                                   "observations": len(normalized), "handoffs": handoff_count,
+                                   "deferred": deferred_count})
+            return IngestResult("accepted", station_id, sequence, batch_id, len(normalized), handoff_count,
+                                packet_id, deferred_count)
     except IngestError as exc:
         raise _reject(connection, exc.code, str(exc), packet.source_name, packet_id, station_id, sequence, timestamp) from exc
     except sqlite3.IntegrityError as exc:

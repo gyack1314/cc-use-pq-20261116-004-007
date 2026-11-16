@@ -22,6 +22,16 @@ python -m orbitbridge --db work.sqlite3 verify
 
 同站点序号须连续。相同包重放返回 `duplicate`，相同序号不同内容或跳号进入隔离记录。所有观测和交接项在一个 SQLite 事务中提交；无匹配订阅的观测仍被保存。订阅规则只影响后续提交的包。`verify` 检查数据库、游标、批次数与交接来源。
 
+## 容量策略与暂缓交接
+
+森林连续出现候选火情时，值守组待办容量可能先于观测站上报速度耗尽。容量策略分两层，均为可核对的显式配置：
+
+- `region-capacity <区域> <上限> --operator <人员>` 设置区域待办上限；`subscription-capacity <订阅编号> <上限> --operator <人员>` 设置订阅组上限。没有策略行表示该层不限；上限 `0` 表示显式关闭。策略行记录操作人与时间，所有变更进入 activity 审计流，`capacity-policies` 可列出全部策略，`region-capacity-remove` / `subscription-capacity-remove` 移除策略并恢复不限。
+- 容量只统计 `handoffs` 中 `pending` 的交接项。容量不足时观测包仍被正常接收：批次、观测与站点游标照常提交，完整证据不丢失；只是匹配但拿不到名额的路由写入 `deferred_routings`（状态 `waiting`，原因 `region_full` / `subscription_full` / `both_full`）。暂缓与隔离表 `quarantine` 物理分离：暂缓是“稍后恢复”，隔离才是真正被拒收的包。
+- 稀缺名额按风险优先分配：`severity` 高者优先，其次置信度；同风险按观测时间与稳定主键确定次序。恢复派单（`deferred` 查看、`capacity-drain` 显式触发）按相同风险序、同风险按 `deferred_id` 到达次序先到先得，保证多站点同时提交时的公平性。
+- 容量恢复有三个触发点，全部在原事务内原子完成：人员 `ack` 确认释放容量、策略放宽或移除、显式 `capacity-drain`。暂缓项派单后状态变为 `dispatched` 并回链新交接编号；`UNIQUE(observation_id, subscription_id)` 与状态检查约束保证不重复派单，站点游标只随成功提交推进，不会倒退。
+- `quality` 增加容量不变量：等待中的暂缓项不得与交接项共存（重复派单）、匹配订阅阈值的观测必须在交接或暂缓中出现（路由不丢失）、容量空闲时不得残留可派单的等待项（活性）。`region-report`、订阅汇总、批次与日报对账均包含 `waiting` / `dispatched` 计数。
+
 可用 `inspect-packet` 或 `inspect-dir` 在不改数据库的情况下诊断待收件文件。目录中存在跳号时，先用 `recovery-plan sat-a incoming/` 查看可连续提交的包，再用 `recovery-resume sat-a incoming/` 按站点序号接收。`quarantine-retry <编号> <原文件>` 只允许重检与隔离记录身份一致的包。
 
 清单是 UTF-8 JSON，含 schema、name 和 packets 数组；每个条目含 file、station_id、sequence 和文件 SHA-256。清单与包放在同一目录。`manifest-check <清单>` 预检摘要、包身份和游标，`manifest-run <清单>` 执行可连续提交的条目。执行时再次核对文件摘要。
